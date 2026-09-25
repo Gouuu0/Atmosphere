@@ -263,9 +263,11 @@ jobs:
             -w /work atmosphere-2839-build bash -euc '
               git config --global --add safe.directory /work/Atmosphere
               git config --global --add safe.directory /work/libnx
+              nproc
+              free -h
               make -C libnx -j2
               make -C libnx/nx install
-              make -C Atmosphere -j$(nproc)
+              make -C Atmosphere -j2
               make -C Atmosphere dist-no-debug-nx_release
             '
 
