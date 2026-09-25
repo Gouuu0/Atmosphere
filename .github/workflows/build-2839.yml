@@ -1,0 +1,284 @@
+name: Experimental 23.0.0 ShadowStack build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch pinned sources and apply patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_dir="$RUNNER_TEMP/ams-2839"
+          mkdir -p "$build_dir"
+          cat > "$build_dir/2839-dmnt-shadow-stack.patch" <<'PATCH'
+          diff --git a/stratosphere/dmnt.gen2/source/dmnt2_gdb_server_impl.cpp b/stratosphere/dmnt.gen2/source/dmnt2_gdb_server_impl.cpp
+          index 83c2489..df5b92c 100644
+          --- a/stratosphere/dmnt.gen2/source/dmnt2_gdb_server_impl.cpp
+          +++ b/stratosphere/dmnt.gen2/source/dmnt2_gdb_server_impl.cpp
+          @@ -293,6 +293,9 @@ namespace ams::dmnt {
+                   };
+           
+                   constexpr const char *GetMemoryStateName(svc::MemoryState state) {
+          +            if (state == svc::MemoryState_ShadowStack) {
+          +                return "ShadowStack     ";
+          +            }
+                       if (static_cast<size_t>(state) < util::size(MemoryStateNames)) {
+                           return MemoryStateNames[static_cast<size_t>(state)];
+                       } else {
+          PATCH
+          cat > "$build_dir/2839-libnx-shadow-stack.patch" <<'PATCH'
+          diff --git a/nx/source/kernel/virtmem.c b/nx/source/kernel/virtmem.c
+          index ed9a7a0..d19e140 100644
+          --- a/nx/source/kernel/virtmem.c
+          +++ b/nx/source/kernel/virtmem.c
+          @@ -27,6 +27,7 @@ static MemRegion g_AliasRegion;
+           static MemRegion g_HeapRegion;
+           static MemRegion g_AslrRegion;
+           static MemRegion g_StackRegion;
+          +static MemRegion g_ShadowStackRegion;
+           
+           static VirtmemReservation *g_Reservations;
+           
+          @@ -131,6 +132,10 @@ static void* _memregionFindRandom(MemRegion* r, size_t size, size_t guard_size)
+                       if (_memregionOverlaps(&g_HeapRegion, cur_addr, cur_addr + size))
+                           continue;
+           
+          +            // Avoid mapping within the shadow stack region [23.0.0+].
+          +            if (_memregionOverlaps(&g_ShadowStackRegion, cur_addr, cur_addr + size))
+          +                continue;
+          +
+                       // Found it.
+                       break;
+                   }
+          @@ -174,6 +179,15 @@ void virtmemSetup(void) {
+                   diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_BadGetInfo_Heap));
+               }
+           
+          +    // Retrieve the reserved shadow stack region if available [23.0.0+].
+          +    // The HOS version may not be initialized yet, so probe GetInfo directly.
+          +    rc = _memregionInitWithInfo(&g_ShadowStackRegion, InfoType_ShadowStackRegionAddress, InfoType_ShadowStackRegionSize);
+          +    if (R_FAILED(rc)) {
+          +        if (R_VALUE(rc) != KERNELRESULT(InvalidEnumValue))
+          +            diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_WeirdKernel));
+          +        _memregionInitHardcoded(&g_ShadowStackRegion, 0, 0);
+          +    }
+          +
+               // Retrieve memory region information for the aslr/stack regions if available [2.0.0+]
+               rc = _memregionInitWithInfo(&g_AslrRegion, InfoType_AslrRegionAddress, InfoType_AslrRegionSize);
+               if (R_SUCCEEDED(rc)) {
+          diff --git a/tests/host/README.md b/tests/host/README.md
+          new file mode 100644
+          index 0000000..88aeb5e
+          --- /dev/null
+          +++ b/tests/host/README.md
+          @@ -0,0 +1,21 @@
+          +# Host regression test for the 23.0.0 ShadowStack region
+          +
+          +Run from the libnx repository root:
+          +
+          +```sh
+          +cc -std=gnu11 -Wall -Wextra -Werror \
+          +  -Itests/host/include -Inx/include/switch \
+          +  tests/host/virtmem_shadow_stack.c -o /tmp/virtmem-shadow-stack-test
+          +/tmp/virtmem-shadow-stack-test
+          +```
+          +
+          +The test compiles the actual allocator with mocked kernel calls and a host-only
+          +newlib lock type shim. It covers kernels without the new GetInfo selectors,
+          +an enabled ShadowStack region (including a straddling candidate), a zero-sized
+          +region, all three address finders, and unexpected address/size query failures.
+          +It fails on the original allocator because that allocator returns addresses
+          +inside the reserved ShadowStack region even when its pages are unmapped.
+          +
+          +This is not a Switch integration test. A devkitPro build and hardware validation
+          +are still required. This patch addresses one concrete libnx omission; it does
+          +not certify completion of Atmosphere issue #2839.
+          diff --git a/tests/host/include/sys/lock.h b/tests/host/include/sys/lock.h
+          new file mode 100644
+          index 0000000..629e81d
+          --- /dev/null
+          +++ b/tests/host/include/sys/lock.h
+          @@ -0,0 +1,4 @@
+          +#pragma once
+          +#include <stdint.h>
+          +typedef uint32_t _LOCK_T;
+          +typedef struct { _LOCK_T lock; uint32_t counter; } _LOCK_RECURSIVE_T;
+          diff --git a/tests/host/virtmem_shadow_stack.c b/tests/host/virtmem_shadow_stack.c
+          new file mode 100644
+          index 0000000..9210242
+          --- /dev/null
+          +++ b/tests/host/virtmem_shadow_stack.c
+          @@ -0,0 +1,78 @@
+          +/* Host regression test. Kernel calls are mocked; the allocator is the real source. */
+          +#include <assert.h>
+          +#include <setjmp.h>
+          +#include <stdio.h>
+          +#include <stdlib.h>
+          +#include "../../nx/source/kernel/virtmem.c"
+          +
+          +static int scenario;
+          +static unsigned rng_calls;
+          +static jmp_buf abort_target;
+          +static Result abort_result;
+          +
+          +u64 randomGet64(void) {
+          +    /* Probe a range straddling, then inside, then outside the reserved region. */
+          +    const u64 offsets[] = { 3, 4, 8 };
+          +    assert(rng_calls < 3);
+          +    return offsets[rng_calls++];
+          +}
+          +Result svcGetInfo(u64 *out, u32 id, Handle handle, u64 sub_id) {
+          +    assert(handle == CUR_PROCESS_HANDLE && sub_id == 0);
+          +    switch (id) {
+          +        case InfoType_AliasRegionAddress: *out = 0x200000; return 0;
+          +        case InfoType_AliasRegionSize: *out = 0x1000; return 0;
+          +        case InfoType_HeapRegionAddress: *out = 0x300000; return 0;
+          +        case InfoType_HeapRegionSize: *out = 0x1000; return 0;
+          +        case InfoType_AliasRegionExtraSize: *out = 0; return 0;
+          +        case InfoType_AslrRegionAddress:
+          +        case InfoType_StackRegionAddress: *out = 0x100000; return 0;
+          +        case InfoType_AslrRegionSize:
+          +        case InfoType_StackRegionSize: *out = 0x10000; return 0;
+          +        case InfoType_ShadowStackRegionAddress:
+          +            if (scenario == 0) return KERNELRESULT(InvalidEnumValue);
+          +            if (scenario == 3) return KERNELRESULT(InvalidHandle);
+          +            *out = scenario == 2 ? 0 : 0x104000; return 0;
+          +        case InfoType_ShadowStackRegionSize:
+          +            if (scenario == 4) return KERNELRESULT(InvalidHandle);
+          +            *out = scenario == 2 ? 0 : 0x4000; return 0;
+          +        default: abort();
+          +    }
+          +}
+          +Result svcQueryMemory(MemoryInfo *out, u32 *page, u64 addr) {
+          +    (void)addr;
+          +    /* Even unused pages in ShadowStack look unmapped. */
+          +    *out = (MemoryInfo){ .addr = 0x100000, .size = 0x10000, .type = MemType_Unmapped };
+          +    *page = 0;
+          +    return 0;
+          +}
+          +Result svcUnmapMemory(void *dst, void *src, u64 size) {
+          +    (void)dst; (void)src; (void)size;
+          +    abort();
+          +}
+          +void diagAbortWithResult(Result rc) { abort_result = rc; longjmp(abort_target, 1); }
+          +void mutexLock(Mutex *m) { *m = 1; }
+          +void mutexUnlock(Mutex *m) { *m = 0; }
+          +bool mutexIsLockedByCurrentThread(const Mutex *m) { return *m == 1; }
+          +void *__libnx_alloc(size_t n) { return malloc(n); }
+          +void __libnx_free(void *p) { free(p); }
+          +
+          +int main(void) {
+          +    void *(*finders[])(size_t, size_t) = { virtmemFindAslr, virtmemFindStack, virtmemFindCodeMemory };
+          +    for (scenario = 0; scenario <= 2; ++scenario) {
+          +        virtmemSetup();
+          +        virtmemLock();
+          +        for (unsigned f = 0; f < 3; ++f) {
+          +            rng_calls = 0;
+          +            uintptr_t addr = (uintptr_t)finders[f](0x2000, 0);
+          +            assert(addr == (scenario == 1 ? 0x108000 : 0x103000));
+          +            assert(rng_calls == (scenario == 1 ? 3 : 1));
+          +        }
+          +        virtmemUnlock();
+          +    }
+          +    for (scenario = 3; scenario <= 4; ++scenario) {
+          +        abort_result = 0;
+          +        if (setjmp(abort_target) == 0) { virtmemSetup(); assert(!"expected abort"); }
+          +        assert(abort_result == MAKERESULT(Module_Libnx, LibnxError_WeirdKernel));
+          +    }
+          +    puts("PASS: old kernels, ShadowStack exclusion (3 allocators), empty region, query errors");
+          +}
+          PATCH
+          git init "$build_dir/Atmosphere"
+          git -C "$build_dir/Atmosphere" fetch --depth=1 https://github.com/Atmosphere-NX/Atmosphere.git 2ae182bd5d6289f9d933e9782e144235ed56de1b
+          git -C "$build_dir/Atmosphere" checkout --detach FETCH_HEAD
+          git -C "$build_dir/Atmosphere" apply "$build_dir/2839-dmnt-shadow-stack.patch"
+          git init "$build_dir/libnx"
+          git -C "$build_dir/libnx" fetch --depth=1 https://github.com/switchbrew/libnx.git 146c3d1446d35546943c7b6cfcd479bc1f5e9b67
+          git -C "$build_dir/libnx" checkout --detach FETCH_HEAD
+          git -C "$build_dir/libnx" apply "$build_dir/2839-libnx-shadow-stack.patch"
+          cc -std=gnu11 -Wall -Wextra -Werror \
+            -I"$build_dir/libnx/tests/host/include" -I"$build_dir/libnx/nx/include/switch" \
+            "$build_dir/libnx/tests/host/virtmem_shadow_stack.c" -o "$build_dir/virtmem-test"
+          "$build_dir/virtmem-test"
+
+      - name: Build the upstream toolchain image
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ams-2839/Atmosphere"
+          cp Dockerfile Dockerfile.experimental
+          cat >> Dockerfile.experimental <<'DOCKERFILE'
+
+          USER root
+          RUN dkp-pacman -S --needed --noconfirm devkitARM devkitarm-rules switch-glm switch-libjpeg-turbo
+          DOCKERFILE
+          docker build -f Dockerfile.experimental -t atmosphere-2839-build .
+
+      - name: Compile patched libnx and Atmosphere
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --user root \
+            -v "$RUNNER_TEMP/ams-2839:/work" \
+            -w /work atmosphere-2839-build bash -euc '
+              git config --global --add safe.directory /work/Atmosphere
+              git config --global --add safe.directory /work/libnx
+              make -C libnx -j2
+              make -C libnx/nx install
+              make -C Atmosphere -j2
+              make -C Atmosphere dist-no-debug-nx_release
+            '
+
+      - name: Collect the SD archive and matching payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, os, pathlib, shutil, zipfile
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ams-2839/Atmosphere'
+          out = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'experimental-build'
+          out.mkdir()
+          archives = list(root.glob('out/**/atmosphere-*.zip'))
+          if len(archives) != 1:
+              raise SystemExit(f'Expected one release archive, found {archives}')
+          archive = archives[0]
+          payload = archive.parent / 'fusee.bin'
+          if not payload.is_file() or payload.stat().st_size == 0:
+              raise SystemExit('Missing fusee.bin')
+          with zipfile.ZipFile(archive) as z:
+              if z.testzip() is not None or 'atmosphere/package3' not in z.namelist():
+                  raise SystemExit('Invalid SD archive')
+              if z.read('atmosphere/reboot_payload.bin') != payload.read_bytes():
+                  raise SystemExit('Payload does not match SD archive')
+          shutil.copy2(archive, out / 'atmosphere-23-experimental-SD.zip')
+          shutil.copy2(payload, out / 'fusee.bin')
+          (out / 'README.txt').write_text(
+              'EXPERIMENTAL — not hardware validated. Not a complete fix for issue #2839.\n'
+              'Atmosphere base: 2ae182bd5d6289f9d933e9782e144235ed56de1b\n'
+              'libnx base: 146c3d1446d35546943c7b6cfcd479bc1f5e9b67\n'
+              'Patches: ShadowStack address exclusion in libnx; dmnt.gen2 memory label.\n'
+              'SD ZIP and fusee.bin come from the same build.\n'
+              'Back up the existing SD setup before testing.\n'
+              'Boot instructions depend on your current bootloader configuration.\n', encoding='utf-8')
+          files = sorted(out.iterdir())
+          (out / 'SHA256SUMS').write_text(''.join(
+              f'{hashlib.sha256(f.read_bytes()).hexdigest()}  {f.name}\n' for f in files))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atmosphere-23-experimental
+          path: experimental-build/
+          if-no-files-found: error
+          retention-days: 7
