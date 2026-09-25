@@ -201,8 +201,37 @@ jobs:
           PATCH
           git init "$build_dir/Atmosphere"
           git -C "$build_dir/Atmosphere" fetch --depth=1 https://github.com/Atmosphere-NX/Atmosphere.git 2ae182bd5d6289f9d933e9782e144235ed56de1b
-          git -C "$build_dir/Atmosphere" checkout --detach FETCH_HEAD
+          git -C "$build_dir/Atmosphere" checkout -b experimental-2839 FETCH_HEAD
           git -C "$build_dir/Atmosphere" apply "$build_dir/2839-dmnt-shadow-stack.patch"
+          cat > "$build_dir/shader-order.patch" <<'PATCH'
+          diff --git a/troposphere/daybreak/Makefile b/troposphere/daybreak/Makefile
+          index adb6339..193c94e 100644
+          --- a/troposphere/daybreak/Makefile
+          +++ b/troposphere/daybreak/Makefile
+          @@ -188,7 +188,7 @@ endif
+           all: $(ROMFS_TARGETS) | $(BUILD)
+           	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+           
+          -$(BUILD):
+          +$(BUILD): $(ROMFS_TARGETS)
+           	@mkdir -p $@
+           
+           ifneq ($(strip $(ROMFS_TARGETS)),)
+          diff --git a/troposphere/haze/Makefile b/troposphere/haze/Makefile
+          index e1e2994..c42c0dc 100644
+          --- a/troposphere/haze/Makefile
+          +++ b/troposphere/haze/Makefile
+          @@ -177,7 +177,7 @@ endif
+           #---------------------------------------------------------------------------------
+           all: $(ROMFS_TARGETS) | $(BUILD)
+           
+          -$(BUILD):
+          +$(BUILD): $(ROMFS_TARGETS)
+           	@[ -d $@ ] || mkdir -p $@
+           	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+           
+          PATCH
+          git -C "$build_dir/Atmosphere" apply "$build_dir/shader-order.patch"
           git init "$build_dir/libnx"
           git -C "$build_dir/libnx" fetch --depth=1 https://github.com/switchbrew/libnx.git 146c3d1446d35546943c7b6cfcd479bc1f5e9b67
           git -C "$build_dir/libnx" checkout --detach FETCH_HEAD
@@ -236,7 +265,7 @@ jobs:
               git config --global --add safe.directory /work/libnx
               make -C libnx -j2
               make -C libnx/nx install
-              make -C Atmosphere -j2
+              make -C Atmosphere -j$(nproc)
               make -C Atmosphere dist-no-debug-nx_release
             '
 
